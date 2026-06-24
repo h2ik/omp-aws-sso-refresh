@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 /**
  * AWS SSO auto-refresh for omp.
@@ -14,6 +15,19 @@ import { readFileSync } from "node:fs";
  * rather than trying to recover from it — the extension event surface has no
  * hook that can resume a turn that already errored out.
  *
+ * Validity check:
+ *   - SSO profiles (an `sso_session` on the active AWS_PROFILE): read the
+ *     token expiry straight from the CLI's own cache —
+ *     `~/.aws/sso/cache/<sha1(session-name)>.json` — and compare `expiresAt`
+ *     to now. This is exactly the file AWS CLI v2 / botocore key by, so it is
+ *     zero-network and has no staleness window: every turn sees the true
+ *     expiry. A small skew triggers the refresh slightly early so a long turn
+ *     never crosses the boundary mid-stream.
+ *   - Non-SSO profiles (static keys, credential_process, role chains): no
+ *     local expiry to read, so fall back to an `aws sts get-caller-identity`
+ *     probe, throttled to at most once per PROBE_TTL_MS to avoid taxing every
+ *     turn.
+ *
  * Refresh-command resolution order:
  *   1. `awsAuthRefresh` key in ~/.omp/agent/config.yml (verbatim, like Claude Code)
  *   2. derived `aws sso login --sso-session <session>`, where <session> is the
@@ -23,6 +37,14 @@ import { readFileSync } from "node:fs";
 
 const OMP_CONFIG_PATH = join(homedir(), ".omp", "agent", "config.yml");
 const AWS_CONFIG_PATH = process.env.AWS_CONFIG_FILE || join(homedir(), ".aws", "config");
+const AWS_SSO_CACHE_DIR = join(homedir(), ".aws", "sso", "cache");
+
+/** Treat an SSO token as expired this long before its real `expiresAt`, so a
+ *  long turn started just under the wire does not expire mid-stream. */
+const EXPIRY_SKEW_MS = 60_000;
+
+/** Throttle for the non-SSO fallback `sts` probe (the SSO path is local/cheap). */
+const PROBE_TTL_MS = 60_000;
 
 /** Read the `awsAuthRefresh:` top-level scalar from config.yml without a YAML dep. */
 function configuredRefreshCommand(): string | undefined {
@@ -36,16 +58,14 @@ function configuredRefreshCommand(): string | undefined {
   }
 }
 
-/** Find the sso_session for the active profile in ~/.aws/config → a login command. */
-function deriveSsoLoginCommand(): string | undefined {
-  const profile = process.env.AWS_PROFILE || "default";
+/** Read a single `key = value` from an INI section (e.g. `[profile foo]`) in ~/.aws/config. */
+function awsConfigValue(header: string, key: string): string | undefined {
   let text: string;
   try {
     text = readFileSync(AWS_CONFIG_PATH, "utf8");
   } catch {
     return undefined;
   }
-  const header = profile === "default" ? "[default]" : `[profile ${profile}]`;
   let inSection = false;
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trim();
@@ -53,18 +73,43 @@ function deriveSsoLoginCommand(): string | undefined {
       inSection = line === header;
       continue;
     }
-    if (inSection) {
-      const m = line.match(/^sso_session\s*=\s*(.+)$/);
-      if (m) return `aws sso login --sso-session ${m[1].trim()}`;
-    }
+    if (!inSection) continue;
+    const eq = line.indexOf("=");
+    if (eq !== -1 && line.slice(0, eq).trim() === key) return line.slice(eq + 1).trim();
   }
   return undefined;
 }
 
+/** The `sso_session` name of the active AWS_PROFILE, or undefined for a non-SSO profile. */
+function activeSsoSession(): string | undefined {
+  const profile = process.env.AWS_PROFILE || "default";
+  const header = profile === "default" ? "[default]" : `[profile ${profile}]`;
+  return awsConfigValue(header, "sso_session");
+}
+
+/** Epoch-ms expiry of the cached SSO token for `session`, or undefined when no
+ *  usable token is cached. The CLI keys the cache by sha1 of the session name. */
+function ssoTokenExpiryMs(session: string): number | undefined {
+  const file = join(AWS_SSO_CACHE_DIR, `${createHash("sha1").update(session).digest("hex")}.json`);
+  try {
+    const data = JSON.parse(readFileSync(file, "utf8")) as { accessToken?: unknown; expiresAt?: unknown };
+    if (!data.accessToken || typeof data.expiresAt !== "string") return undefined;
+    const t = Date.parse(data.expiresAt);
+    return Number.isNaN(t) ? undefined : t;
+  } catch {
+    return undefined;
+  }
+}
+
+/** True when `session`'s cached SSO token exists and is not within the skew of expiry. */
+function ssoTokenValid(session: string): boolean {
+  const expiry = ssoTokenExpiryMs(session);
+  return expiry !== undefined && Date.now() + EXPIRY_SKEW_MS < expiry;
+}
+
 export default function awsSsoRefresh(pi: ExtensionAPI): void {
-  // Cache the "creds are good" verdict for the process; re-probe only after a
-  // turn where we believed they were bad, or once per cold start.
-  let knownValid = false;
+  // Last time the non-SSO `sts` probe ran (epoch ms); unused on the SSO path.
+  let lastProbeAt = 0;
 
   // pi.exec(program, argsArray, opts) spreads argsArray into [program, ...args];
   // it does NOT accept a single command string. Tokenize on whitespace (these
@@ -74,10 +119,10 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
     await pi.exec(program, args);
   }
 
-  async function credsValid(): Promise<boolean> {
+  // get-caller-identity exercises the same credential chain Bedrock signs with;
+  // exit 0 = resolvable & unexpired, non-zero = needs refresh.
+  async function probeValid(): Promise<boolean> {
     try {
-      // get-caller-identity exercises the same credential chain Bedrock signs
-      // with; exit 0 = resolvable & unexpired, non-zero = needs refresh.
       await run("aws sts get-caller-identity");
       return true;
     } catch {
@@ -86,18 +131,23 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
   }
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    if (knownValid) return;
+    const session = activeSsoSession();
 
-    if (await credsValid()) {
-      knownValid = true;
-      return;
+    if (session) {
+      // SSO: exact, zero-network expiry read — checked every turn.
+      if (ssoTokenValid(session)) return;
+    } else {
+      // Non-SSO: no local expiry to read; fall back to a throttled probe.
+      if (Date.now() - lastProbeAt < PROBE_TTL_MS) return;
+      lastProbeAt = Date.now();
+      if (await probeValid()) return;
     }
 
-    const command = configuredRefreshCommand() ?? deriveSsoLoginCommand();
+    const command = configuredRefreshCommand() ?? (session ? `aws sso login --sso-session ${session}` : undefined);
     if (!command) {
       ctx.ui.notify(
         "AWS credentials expired and no refresh command found. Set `awsAuthRefresh` in config.yml or an sso_session on your AWS_PROFILE, then run `aws sso login`.",
-        "warn",
+        "warning",
       );
       return;
     }
@@ -108,16 +158,22 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
     } catch (err) {
       ctx.ui.notify(
         `AWS refresh command failed (${command}): ${err instanceof Error ? err.message : String(err)}`,
-        "warn",
+        "warning",
       );
       return;
     }
 
-    if (await credsValid()) {
-      knownValid = true;
-      ctx.ui.notify("AWS credentials refreshed.", "info");
+    // Re-confirm via the same signal we used to detect the lapse.
+    let ok: boolean;
+    if (session) {
+      ok = ssoTokenValid(session);
     } else {
-      ctx.ui.notify("AWS refresh ran but credentials still invalid.", "warn");
+      lastProbeAt = Date.now();
+      ok = await probeValid();
     }
+    ctx.ui.notify(
+      ok ? "AWS credentials refreshed." : "AWS refresh ran but credentials still invalid.",
+      ok ? "info" : "warning",
+    );
   });
 }

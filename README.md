@@ -10,14 +10,16 @@ omp's extension events (`auto_retry_start`, `credential_disabled`) are notificat
 
 ## How it works
 
-On `before_agent_start` (cached per process — one probe per cold start, re-probed only after a refresh):
+On `before_agent_start` it checks whether the active credentials are still good, and refreshes if not:
 
-1. Probe `aws sts get-caller-identity` — the same credential chain Bedrock signs with. Exit 0 = valid, skip. Non-zero = refresh.
-2. Resolve a refresh command:
+1. Determine validity:
+   - **SSO profile** (an `sso_session` on your active `AWS_PROFILE`): read the token expiry directly from the CLI's own cache — `~/.aws/sso/cache/<sha1(session-name)>.json`, the exact file AWS CLI v2 / botocore key by — and compare `expiresAt` to now. Zero network, no staleness window: every turn sees the true expiry. A 60s skew refreshes slightly early so a long turn never expires mid-stream.
+   - **Non-SSO profile** (static keys, `credential_process`, role chains): no local expiry to read, so fall back to an `aws sts get-caller-identity` probe, throttled to at most once per 60s.
+2. If invalid, resolve a refresh command:
    - `awsAuthRefresh` key in `~/.omp/agent/config.yml` (verbatim, like Claude Code), else
    - derived `aws sso login --sso-session <session>` from the `sso_session` of your active `AWS_PROFILE` in `~/.aws/config`, else
    - notify-only.
-3. Run it (blocking — the browser SSO flow completes before the turn proceeds), re-probe, continue.
+3. Run it (blocking — the browser SSO flow completes before the turn proceeds), re-confirm, continue.
 
 ## Install
 
