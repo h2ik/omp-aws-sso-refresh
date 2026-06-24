@@ -1,0 +1,19 @@
+{
+  "name": "omp-aws-sso-refresh",
+  "version": "0.1.0",
+  "description": "Auto-refresh AWS SSO credentials before an omp turn (Claude Code awsAuthRefresh, for oh-my-pi)",
+  "keywords": ["oh-my-pi", "omp", "extension", "aws", "sso", "bedrock"],
+  "license": "MIT",
+  "author": "h2ik",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/h2ik/omp-aws-sso-refresh.git"
+  },
+  "type": "module",
+  "omp": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/pi-coding-agent": "*"
+  }
+}
