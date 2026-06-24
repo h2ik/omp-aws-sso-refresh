@@ -66,11 +66,19 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
   // turn where we believed they were bad, or once per cold start.
   let knownValid = false;
 
+  // pi.exec(program, argsArray, opts) spreads argsArray into [program, ...args];
+  // it does NOT accept a single command string. Tokenize on whitespace (these
+  // commands have no quoted args) and split program from args.
+  async function run(command: string): Promise<void> {
+    const [program, ...args] = command.split(/\s+/).filter(Boolean);
+    await pi.exec(program, args);
+  }
+
   async function credsValid(): Promise<boolean> {
     try {
       // get-caller-identity exercises the same credential chain Bedrock signs
       // with; exit 0 = resolvable & unexpired, non-zero = needs refresh.
-      await pi.exec("aws sts get-caller-identity");
+      await run("aws sts get-caller-identity");
       return true;
     } catch {
       return false;
@@ -96,7 +104,7 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
 
     ctx.ui.notify(`AWS credentials expired — running: ${command}`, "info");
     try {
-      await pi.exec(command);
+      await run(command);
     } catch (err) {
       ctx.ui.notify(
         `AWS refresh command failed (${command}): ${err instanceof Error ? err.message : String(err)}`,
