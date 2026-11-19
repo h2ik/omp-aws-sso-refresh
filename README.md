@@ -10,7 +10,7 @@ omp's extension events (`auto_retry_start`, `credential_disabled`) are notificat
 
 ## How it works
 
-On `before_agent_start` it checks whether the active credentials are still good, and refreshes if not:
+On `before_agent_start` it checks whether the active credentials are still good, and refreshes if not. Turns whose model isn't served through Bedrock (provider `amazon-bedrock` / `bedrock-mantle`, or any model on the `bedrock-converse-stream` API) are skipped entirely — no expiry check, no `sts` probe, no login prompt — so local models and other providers never trigger a refresh.
 
 1. Determine validity:
    - **SSO profile** (an `sso_session` on your active `AWS_PROFILE`): read the token expiry directly from the CLI's own cache — `~/.aws/sso/cache/<sha1(session-name)>.json`, the exact file AWS CLI v2 / botocore key by — and compare `expiresAt` to now. Zero network, no staleness window: every turn sees the true expiry. A 60s skew refreshes slightly early so a long turn never expires mid-stream.
