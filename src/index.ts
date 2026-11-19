@@ -7,10 +7,12 @@ import { createHash } from "node:crypto";
 /**
  * AWS SSO auto-refresh for omp.
  *
- * Mirrors Claude Code's `awsAuthRefresh`: before each agent turn, check
- * whether AWS credentials are still valid; if not, run a configured refresh
- * command (e.g. `aws sso login --sso-session <name>`), block until it
- * completes, then continue. This PREVENTS the mid-turn SigV4 signing failure
+ * Mirrors Claude Code's `awsAuthRefresh`: before each agent turn that targets
+ * a Bedrock model, check whether AWS credentials are still valid; if not, run
+ * a configured refresh command (e.g. `aws sso login --sso-session <name>`),
+ * block until it completes, then continue. Turns on any other provider (local
+ * models, Anthropic, OpenAI, ...) are skipped entirely. This PREVENTS the
+ * mid-turn SigV4 signing failure
  * that omp's bedrock credential resolver throws on an expired SSO token,
  * rather than trying to recover from it — the extension event surface has no
  * hook that can resume a turn that already errored out.
@@ -45,6 +47,16 @@ const EXPIRY_SKEW_MS = 60_000;
 
 /** Throttle for the non-SSO fallback `sts` probe (the SSO path is local/cheap). */
 const PROBE_TTL_MS = 60_000;
+
+/** Providers whose requests are SigV4-signed with the AWS credential chain. */
+const AWS_SIGNED_PROVIDERS: Record<string, true> = { "amazon-bedrock": true, "bedrock-mantle": true };
+
+/** True when `model` is served through Bedrock — a built-in Bedrock provider, or
+ *  a custom provider speaking the Bedrock Converse API. */
+function usesAwsCredentials(model: { api: string; provider: string } | undefined): boolean {
+  if (!model) return false;
+  return model.api === "bedrock-converse-stream" || AWS_SIGNED_PROVIDERS[model.provider] === true;
+}
 
 /** Read the `awsAuthRefresh:` top-level scalar from config.yml without a YAML dep. */
 function configuredRefreshCommand(): string | undefined {
@@ -131,6 +143,9 @@ export default function awsSsoRefresh(pi: ExtensionAPI): void {
   }
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    // Only Bedrock turns sign with AWS credentials; leave every other provider alone.
+    if (!usesAwsCredentials(ctx.model)) return;
+
     const session = activeSsoSession();
 
     if (session) {
